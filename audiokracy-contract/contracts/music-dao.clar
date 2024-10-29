@@ -143,8 +143,6 @@
 ;; Safe transfer function with additional checks
 (define-private (safe-transfer-shares (token-id uint) (from principal) (to principal) (amount uint))
     (let ((validated-token-id (try! (validate-and-sanitize-token-id token-id))))
-        ;; Additional check to ensure the token exists
-        (asserts! (is-some (map-get? tokens {id: validated-token-id})) ERR-INVALID-TOKEN-ID)
         (let ((from-holdings (unwrap! (map-get? share-holdings 
                 {token-id: validated-token-id, holder: from})
                 ERR-NOT-FOUND))
@@ -251,3 +249,68 @@
                      auction-data: none})
                 (ok true)))))
 
+;; Secure purchase function
+(define-public (purchase-shares (token-id uint))
+    (let ((validated-token-id (try! (validate-and-sanitize-token-id token-id))))
+        (begin
+            (try! (check-not-paused))
+            (try! (check-not-blacklisted tx-sender))
+            
+            (let ((listing (unwrap! (map-get? listings {token-id: validated-token-id}) 
+                    ERR-NOT-FOUND))
+                  (price (get price listing))
+                  (seller (get seller listing))
+                  (shares-amount (get shares-amount listing)))
+                
+                ;; Enhanced validations
+                (asserts! (<= block-height (get expiry listing)) ERR-EXPIRED)
+                (asserts! (not (is-eq tx-sender seller)) ERR-INVALID-PARAMETER)
+                
+                ;; Balance checks with overflow prevention
+                (let ((balance (stx-get-balance tx-sender)))
+                    (asserts! (and 
+                        (>= balance price)
+                        (>= price MIN-PRICE)
+                        (< price (pow u2 u64))) ;; Prevent overflow
+                        ERR-INSUFFICIENT-BALANCE))
+                
+                ;; Calculate fees with overflow prevention
+                (let ((platform-fee (/ (* price PLATFORM-FEE-PERCENTAGE) u1000))
+                      (seller-payment (- price platform-fee)))
+                    
+                    ;; Execute transfers
+                    (try! (stx-transfer? platform-fee tx-sender (var-get platform-treasury)))
+                    (try! (stx-transfer? seller-payment tx-sender seller))
+                    
+                    ;; Transfer shares using the safe transfer function
+                    (match (map-get? share-holdings 
+                            {token-id: validated-token-id, holder: seller})
+                        seller-holdings 
+                            (begin
+                                (asserts! (>= (get amount seller-holdings) shares-amount) 
+                                    ERR-INSUFFICIENT-BALANCE)
+                                (try! (safe-transfer-shares validated-token-id seller tx-sender shares-amount))
+                                (map-delete listings {token-id: validated-token-id})
+                                (ok true))
+                        ERR-NOT-FOUND))))))
+
+;; Administrative Functions
+(define-public (set-contract-paused (new-state bool))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (not (is-eq new-state (var-get contract-paused))) ERR-INVALID-PARAMETER)
+        (var-set contract-paused new-state)
+        (ok true)))
+
+(define-public (set-platform-treasury (new-treasury principal))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (not (is-eq new-treasury (var-get platform-treasury))) ERR-INVALID-PARAMETER)
+        (ok (var-set platform-treasury new-treasury))))
+
+(define-public (trigger-emergency-shutdown)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (var-set emergency-shutdown-active true)
+        (var-set contract-paused true)
+        (ok true)))
