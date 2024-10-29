@@ -98,3 +98,156 @@
     {address: principal}
     {until: uint,
      reason: (string-utf8 256)})
+
+(define-map reward-pools
+    {cycle: uint}
+    {total-amount: uint,
+     distributed: bool})
+
+;; Enhanced input validation functions
+(define-private (validate-and-sanitize-token-id (token-id uint))
+    (begin
+        ;; Check basic bounds
+        (asserts! (and 
+            (>= token-id MIN-TOKEN-ID)
+            (<= token-id MAX-TOKEN-ID)) 
+            ERR-INVALID-TOKEN-ID)
+        
+        ;; Check against total tokens
+        (asserts! (<= token-id (var-get total-tokens)) 
+            ERR-INVALID-TOKEN-ID)
+        
+        ;; Verify token exists
+        (match (map-get? tokens {id: token-id})
+            token (ok token-id)
+            ERR-NOT-FOUND)))
+
+(define-private (verify-token-ownership (token-id uint) (owner principal))
+    (match (map-get? tokens {id: token-id})
+        token (ok (is-eq (get owner token) owner))
+        ERR-NOT-FOUND))
+
+;; Helper Functions
+(define-private (check-not-paused)
+    (if (var-get contract-paused)
+        ERR-PAUSED
+        (ok true)))
+
+(define-private (check-not-blacklisted (address principal))
+    (match (map-get? blacklist {address: address})
+        blacklist-entry (if (>= block-height (get until blacklist-entry))
+                           (ok true)
+                           ERR-BLACKLISTED)
+        (ok true)))
+
+;; Safe transfer function with additional checks
+(define-private (safe-transfer-shares (token-id uint) (from principal) (to principal) (amount uint))
+    (let ((validated-token-id (try! (validate-and-sanitize-token-id token-id))))
+        ;; Additional check to ensure the token exists
+        (asserts! (is-some (map-get? tokens {id: validated-token-id})) ERR-INVALID-TOKEN-ID)
+        (let ((from-holdings (unwrap! (map-get? share-holdings 
+                {token-id: validated-token-id, holder: from})
+                ERR-NOT-FOUND))
+              (to-holdings (default-to 
+                {amount: u0, locked-until: u0}
+                (map-get? share-holdings {token-id: validated-token-id, holder: to}))))
+            
+            ;; Additional safety checks
+            (asserts! (>= (get amount from-holdings) amount) ERR-INSUFFICIENT-BALANCE)
+            (asserts! (< (+ (get amount to-holdings) amount) (pow u2 u64)) ERR-INVALID-PARAMETER) ;; Prevent overflow
+            
+            (map-set share-holdings
+                {token-id: validated-token-id, holder: from}
+                {amount: (- (get amount from-holdings) amount),
+                 locked-until: (get locked-until from-holdings)})
+            
+            (map-set share-holdings
+                {token-id: validated-token-id, holder: to}
+                {amount: (+ (get amount to-holdings) amount),
+                 locked-until: (get locked-until to-holdings)})
+            
+            (ok true))))
+
+;; Core Token Functions
+(define-public (mint-token
+    (metadata-url (string-utf8 256))
+    (royalty-percentage uint)
+    (total-shares uint))
+    (begin
+        (try! (check-not-paused))
+        (try! (check-not-blacklisted tx-sender))
+        (asserts! (>= (len metadata-url) u10) ERR-INVALID-PARAMETER)
+        (asserts! (<= royalty-percentage MAX-ROYALTY-PERCENTAGE) ERR-INVALID-PARAMETER)
+        (asserts! (and 
+            (> total-shares u0)
+            (< total-shares (pow u2 u64))) ERR-INVALID-PARAMETER)
+        
+        (let ((token-id (+ (var-get total-tokens) u1)))
+            (try! (validate-and-sanitize-token-id token-id))
+            (try! (ft-mint? music-shares total-shares tx-sender))
+            (map-set tokens
+                {id: token-id}
+                {owner: tx-sender,
+                 artist: tx-sender,
+                 metadata-url: metadata-url,
+                 royalty-percentage: royalty-percentage,
+                 total-shares: total-shares,
+                 locked: false,
+                 created-at: block-height,
+                 revenue-generated: u0,
+                 verified: false})
+            
+            (map-set share-holdings
+                {token-id: token-id, holder: tx-sender}
+                {amount: total-shares,
+                 locked-until: u0})
+            
+            (var-set total-tokens token-id)
+            (ok token-id))))
+
+;; Marketplace Functions
+(define-public (list-shares
+    (token-id uint)
+    (shares-amount uint)
+    (price uint))
+    (let 
+        ((validated-token-id (try! (validate-and-sanitize-token-id token-id))))
+        (begin
+            (try! (check-not-paused))
+            (try! (check-not-blacklisted tx-sender))
+            
+            ;; Verify ownership
+            (asserts! (unwrap! (verify-token-ownership validated-token-id tx-sender) ERR-NOT-FOUND)
+                ERR-NOT-AUTHORIZED)
+            
+            ;; Price validation
+            (asserts! (and 
+                (>= price MIN-PRICE)
+                (< price (pow u2 u64))) ;; Prevent overflow
+                ERR-INVALID-PARAMETER)
+            
+            ;; Holdings validation
+            (let ((holdings (unwrap! (map-get? share-holdings 
+                    {token-id: validated-token-id, holder: tx-sender})
+                    ERR-NOT-FOUND)))
+                
+                ;; Additional safety checks
+                (asserts! (and
+                    (>= (get amount holdings) shares-amount)
+                    (> shares-amount u0)
+                    (< shares-amount (pow u2 u64))) ;; Prevent overflow
+                    ERR-INVALID-PARAMETER)
+                
+                (asserts! (>= block-height (get locked-until holdings)) 
+                    ERR-STATE-INVALID)
+                
+                ;; Safe to proceed with listing
+                (map-set listings
+                    {token-id: validated-token-id}
+                    {price: price,
+                     seller: tx-sender,
+                     expiry: (+ block-height u1440),
+                     shares-amount: shares-amount,
+                     auction-data: none})
+                (ok true)))))
+
