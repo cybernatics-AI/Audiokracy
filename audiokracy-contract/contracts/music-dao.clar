@@ -1,5 +1,4 @@
 ;; Music Rights and DAO Platform Contract
-;; Core functionality for music rights management, marketplace, governance, and staking
 
 ;; Error Codes
 (define-constant ERR-NOT-AUTHORIZED (err u1000))
@@ -143,6 +142,8 @@
 ;; Safe transfer function with additional checks
 (define-private (safe-transfer-shares (token-id uint) (from principal) (to principal) (amount uint))
     (let ((validated-token-id (try! (validate-and-sanitize-token-id token-id))))
+        ;; Additional check to ensure the token exists
+        (asserts! (is-some (map-get? tokens {id: validated-token-id})) ERR-INVALID-TOKEN-ID)
         (let ((from-holdings (unwrap! (map-get? share-holdings 
                 {token-id: validated-token-id, holder: from})
                 ERR-NOT-FOUND))
@@ -256,6 +257,11 @@
             (try! (check-not-paused))
             (try! (check-not-blacklisted tx-sender))
             
+            ;; Additional check to ensure validated-token-id is within valid range
+            (asserts! (and (>= validated-token-id MIN-TOKEN-ID) 
+                           (<= validated-token-id MAX-TOKEN-ID)) 
+                      ERR-INVALID-TOKEN-ID)
+            
             (let ((listing (unwrap! (map-get? listings {token-id: validated-token-id}) 
                     ERR-NOT-FOUND))
                   (price (get price listing))
@@ -289,6 +295,9 @@
                             (begin
                                 (asserts! (>= (get amount seller-holdings) shares-amount) 
                                     ERR-INSUFFICIENT-BALANCE)
+                                ;; Additional check before safe-transfer-shares
+                                (asserts! (is-some (map-get? tokens {id: validated-token-id})) 
+                                          ERR-INVALID-TOKEN-ID)
                                 (try! (safe-transfer-shares validated-token-id seller tx-sender shares-amount))
                                 (map-delete listings {token-id: validated-token-id})
                                 (ok true))
@@ -314,3 +323,4 @@
         (var-set emergency-shutdown-active true)
         (var-set contract-paused true)
         (ok true)))
+        
